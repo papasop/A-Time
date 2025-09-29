@@ -250,4 +250,3 @@ for ts in ts_list:
 plt.grid(True)
 plt.tight_layout()
 plt.show()
-

@@ -1,252 +1,206 @@
+# =========================================================
+# GL2 (order-4) variational integrator for weighted EL ODE
+#   L = 1/2 m qdot^2 + V(q),   EL: d/dt (m w qdot) - w dV/dq = 0
+#   => qddot = (k/m) q - (w'/w) qdot   (V=1/2 k q^2 示例；可替换成一般 V)
+# - Smooth w(t): 演示四阶收敛
+# - Hard step  : 对齐界面并用 A3: p=m w qdot 连续，重置右侧初速
+# =========================================================
+
 import numpy as np
-import matplotlib.pyplot as plt
 
-def sci(x): 
-    return f"{x:.6e}"
+# ---------- utilities ----------
+def sci(x): return f"{x:.6e}"
 
-# ---------- Thomas tridiagonal solver ----------
-def thomas_tridiag(a, b, c, d):
-    n = len(b)
-    cp = np.empty(n)
-    dp = np.empty(n)
-    x = np.empty(n)
-    beta = b[0]
-    cp[0] = c[0]/beta
-    dp[0] = d[0]/beta
-    for i in range(1, n):
-        beta = b[i] - a[i]*cp[i-1]
-        cp[i] = c[i]/beta if i < n-1 else 0.0
-        dp[i] = (d[i] - a[i]*dp[i-1])/beta
-    x[-1] = dp[-1]
-    for i in range(n-2, -1, -1):
-        x[i] = dp[i] - cp[i]*x[i+1]
-    return x
+# ---------- problem setup ----------
+m = 1.0
+k = 10.0                     # 可调；适中避免刚性
+def V(q):      return 0.5*k*q*q
+def dVdq(q):   return k*q
 
-# ---------- Half-step weights ----------
-def half_weights(w):
-    return 0.5*(w[:-1] + w[1:])
+# (1) 平滑权重（处处C^∞）——用于4阶收敛验证
+def w_smooth(t, a=0.3):      # w(t)=1+a sin(2πt) > 0
+    return 1.0 + a*np.sin(2*np.pi*t)
+def wdot_smooth(t, a=0.3):
+    return a*(2*np.pi)*np.cos(2*np.pi*t)
 
-# ---------- High-order derivative (4th-order central difference) ----------
-def high_order_qdot(q, dt):
-    qdot = np.zeros_like(q)
-    qdot[2:-2] = (-q[4:] + 8*q[3:-1] - 8*q[1:-3] + q[:-4]) / (12*dt)
-    qdot[0] = (q[1] - q[0]) / dt
-    qdot[1] = (q[2] - q[0]) / (2*dt)
-    qdot[-2] = (q[-1] - q[-3]) / (2*dt)
-    qdot[-1] = (q[-1] - q[-2]) / dt
-    return qdot
+# (2) 硬截止（分段常数）——用于A3界面条件验证
+def w_hard(t, t_s=0.5, wL=1.0, wR=0.2):
+    return np.where(t < t_s, wL, wR)
 
-# ---------- Build EL system (corrected for linear case) ----------
-def build_EL_halfstep_system(t, w, m=1.0, k=5.0, q0=0.0, qT=1.0):
-    N = len(t)
-    dt = t[1] - t[0]
-    a = np.zeros(N)
-    b = np.zeros(N)
-    c = np.zeros(N)
-    d = np.zeros(N)
-    b[0] = 1.0; d[0] = q0
-    b[-1] = 1.0; d[-1] = qT
-    wh = half_weights(w)
-    for i in range(1, N-1):
-        w_imh = wh[i-1]
-        w_iph = wh[i]
-        a[i] = (m / dt**2) * w_imh
-        b[i] = -(m / dt**2) * (w_imh + w_iph) - w[i] * k
-        c[i] = (m / dt**2) * w_iph
-        d[i] = 0.0
-    d[1] -= a[1] * q0; a[1] = 0.0
-    d[-2] -= c[-2] * qT; c[-2] = 0.0
-    return a, b, c, d
+# 加权EL对应的一阶系统 y=[q,v]
+# y' = f(t,y) with q' = v
+# v' = (k/m) q - (w'/w) v
+def f_EL(t, y, w_fun, wdot_fun=None):
+    q, v = y
+    w  = w_fun(t)
+    if wdot_fun is None:
+        # 分段常数场景（硬截止子区间内），w' = 0
+        wp = 0.0
+    else:
+        wp = wdot_fun(t)
+    return np.array([v, (k/m)*q - (wp/max(w,1e-30))*v], dtype=float)
 
-# ---------- Action and residual (corrected for linear case) ----------
-def action_and_residual_halfstep(q, t, w, m=1.0, k=5.0):
-    N = len(t)
-    dt = t[1] - t[0]
-    wh = half_weights(w)
-    qdot_h = high_order_qdot(q, dt)[:-1]
-    p_h = m * wh * qdot_h
-    R = np.zeros(N)
-    R[1:-1] = (p_h[1:] - p_h[:-1]) / dt - w[1:-1] * k * q[1:-1]
-    R[0] = R[-1] = 0.0
-    qdot = high_order_qdot(q, dt)
-    L_vals = 0.5 * m * qdot**2 + 0.5 * k * q**2
-    S = np.trapz(w * L_vals, t)
-    rms = np.sqrt(np.mean(R[1:-1]**2))
-    return S, rms, R, p_h
+# ---------- GL2（Gauss–Legendre 2-stage, order 4）一步 ----------
+# Butcher tableau:
+# c1,2 = 1/2 ± sqrt(3)/6;  b1=b2=1/2
+# A = [[1/4, 1/4 - s], [1/4 + s, 1/4]],  s = sqrt(3)/6
+c1 = 0.5 - np.sqrt(3)/6.0
+c2 = 0.5 + np.sqrt(3)/6.0
+b1 = b2 = 0.5
+s  = np.sqrt(3)/6.0
+A11, A12 = 0.25, 0.25 - s
+A21, A22 = 0.25 + s, 0.25
 
-# ---------- Exact solution for linear case ----------
-def exact_solution(t, m=1.0, k=5.0, q0=0.0, qT=1.0):
-    omega = np.sqrt(k/m)
-    return q0 + (qT - q0) * np.sinh(omega * t) / np.sinh(omega)
+def gl2_step(tn, yn, h, w_fun, wdot_fun):
+    """
+    Implicit GL2 step for y' = f(t,y) with 2D state y=[q,v].
+    Newton solve for K = [k1, k2], each ki in R^2.
+    """
+    # 初值：用显式Euler做个粗猜
+    f0 = f_EL(tn, yn, w_fun, wdot_fun)
+    K1 = f0.copy()
+    K2 = f0.copy()
 
-# ---------- Nonlinear iteration solver ----------
-def nonlinear_iterate(t, w, m=1.0, k=5.0, alpha=0.1, q0=0.0, qT=1.0, tol=1e-14, max_iter=1000):
-    N = len(t)
-    dt = t[1] - t[0]
-    q = exact_solution(t, m, k, q0, qT)  # Better initial guess
-    for _ in range(max_iter):
-        a = np.zeros(N)
-        b = np.zeros(N)
-        c = np.zeros(N)
-        d = np.zeros(N)
-        b[0] = 1.0; d[0] = q0
-        b[-1] = 1.0; d[-1] = qT
-        wh = half_weights(w)
-        for i in range(1, N-1):
-            w_imh = wh[i-1]
-            w_iph = wh[i]
-            a[i] = (m / dt**2) * w_imh
-            b[i] = -(m / dt**2) * (w_imh + w_iph) - w[i] * (k + 4 * alpha * q[i]**2)
-            c[i] = (m / dt**2) * w_iph
-            d[i] = -w[i] * 4 * alpha * q[i]**3
-        d[1] -= a[1] * q0; a[1] = 0.0
-        d[-2] -= c[-2] * qT; c[-2] = 0.0
-        q_new = thomas_tridiag(a, b, c, d)
-        delta = np.max(np.abs(q_new - q))
-        if delta < tol:
+    for _ in range(20):
+        Y1 = yn + h*(A11*K1 + A12*K2)
+        Y2 = yn + h*(A21*K1 + A22*K2)
+        F1 = f_EL(tn + c1*h, Y1, w_fun, wdot_fun)
+        F2 = f_EL(tn + c2*h, Y2, w_fun, wdot_fun)
+
+        # 残差：G(K)=0
+        R1 = K1 - F1
+        R2 = K2 - F2
+        res = np.linalg.norm(np.hstack([R1,R2]), ord=2)
+        if res < 1e-12:
             break
-        # Adaptive damping
-        damping = min(1.0, 0.5 / max(delta, 1e-10))
-        q = q + damping * (q_new - q)
-    return q
 
-# ---------- Nonlinear residual calculation ----------
-def nonlinear_residual(q, t, w, m=1.0, k=5.0, alpha=0.1):
-    N = len(t)
-    dt = t[1] - t[0]
-    wh = half_weights(w)
-    qdot_h = high_order_qdot(q, dt)[:-1]
-    p_h = m * wh * qdot_h
-    R = np.zeros(N)
-    R[1:-1] = (p_h[1:] - p_h[:-1]) / dt - w[1:-1] * (-(k * q[1:-1] + 4 * alpha * q[1:-1]**3))
-    R[0] = R[-1] = 0.0
-    rms = np.sqrt(np.mean(R[1:-1]**2))
-    return R, rms
+        # 雅可比： dF/dY = Jf(t,Y)
+        # Jf = [[0, 1],[k/m, -(w'/w)]], 评估在 Y1, Y2 时刻
+        # dR1/dK1 = I - h*A11*Jf(t1),  dR1/dK2 = -h*A12*Jf(t1)
+        # dR2/dK1 = -h*A21*Jf(t2),     dR2/dK2 = I - h*A22*Jf(t2)
+        def Jf(t, y):
+            q, v = y
+            w  = w_fun(t)
+            if wdot_fun is None: wp = 0.0
+            else: wp = wdot_fun(t)
+            return np.array([[0.0, 1.0],
+                             [k/m, -wp/max(w,1e-30)]], dtype=float)
 
-# ---------- Test 1: Nonlinear Potential (with iteration) ----------
-print("=== Nonlinear Potential Test ===")
-def nonlinear_L(q, qdot, t):
-    V = 0.5 * 5.0 * q**2 + 0.1 * q**4
-    T = 0.5 * 1.0 * qdot**2
-    return T - V
+        J1 = Jf(tn + c1*h, Y1)
+        J2 = Jf(tn + c2*h, Y2)
 
-N = 64001  # Further increased for better resolution
-T = 1.0
-t = np.linspace(0.0, T, N)
-w = np.ones_like(t)
-q0, qT = 0.0, 1.0
-q_nonlin = nonlinear_iterate(t, w, m=1.0, k=5.0, alpha=0.1, q0=q0, qT=qT)
-qdot = high_order_qdot(q_nonlin, t[1] - t[0])
-L_vals = nonlinear_L(q_nonlin, qdot, t)
-S_nonlin = np.trapz(w * L_vals, t)
-R_nonlin, rms_nonlin = nonlinear_residual(q_nonlin, t, w)
-print(f"S* = {sci(S_nonlin)}")
-print(f"||EL residual||_rms = {sci(rms_nonlin)}")
-print("Note: Using Newton iteration with adaptive damping, high-order derivative, and finer grid.\n")
+        I = np.eye(2)
+        M11 = I - h*A11*J1
+        M12 =   - h*A12*J1
+        M21 =   - h*A21*J2
+        M22 = I - h*A22*J2
 
-# ---------- Test 2: Multiple Interfaces (with smooth weights) ----------
-print("=== Multiple Interfaces Test ===")
-def build_w_multiple_smooth(t, ts_list, w_min=1e-3, width=0.005):  # Adjusted width
-    w = np.full_like(t, w_min)
-    dt = t[1] - t[0]
-    for ts in ts_list:
-        mask = (t >= ts - width) & (t <= ts + width)
-        tau = (t[mask] - (ts - width)) / (2 * width)
-        w[mask] = w_min + (1.0 - w_min) * (0.5 - 0.5 * np.cos(2 * np.pi * tau))
-    return w
+        # 4x4 线性系统求解增量 dK
+        M = np.block([[M11, M12],
+                      [M21, M22]])
+        rhs = -np.hstack([R1, R2])
+        dK  = np.linalg.solve(M, rhs)
+        K1 += dK[:2]
+        K2 += dK[2:]
 
-ts_list = [0.3, 0.7]
-w_multi = build_w_multiple_smooth(t, ts_list, w_min=1e-3, width=0.005)
-a, b, c, d = build_EL_halfstep_system(t, w_multi, m=1.0, k=5.0, q0=q0, qT=qT)
-q_multi = thomas_tridiag(a, b, c, d)
-S_multi, rms_multi, R_multi, p_h_multi = action_and_residual_halfstep(q_multi, t, w_multi)
-print(f"S* = {sci(S_multi)}")
-print(f"||EL residual||_rms = {sci(rms_multi)}")
-dt = t[1] - t[0]
-for ts in ts_list:
-    i_s = int(round(ts / dt - 0.5))
-    if 0 < i_s < len(p_h_multi):
-        jump = abs(p_h_multi[i_s] - p_h_multi[i_s-1])
-        print(f"Jump at ts={ts:.3f}: {sci(jump)} (should ≈0 for continuity)")
-print("\n")
+    yn1 = yn + h*(b1*K1 + b2*K2)
+    return yn1
 
-# ---------- Test 3: Corrected Convergence Analysis ----------
-print("=== Corrected Convergence Analysis (Error vs Exact Solution) ===")
-Ns = [101, 201, 401, 801, 1601, 3201, 6401]
-errors = []
-for N in Ns:
-    t_conv = np.linspace(0, T, N)
-    w_conv = np.ones_like(t_conv)
-    a, b, c, d = build_EL_halfstep_system(t_conv, w_conv, m=1.0, k=5.0, q0=0, qT=1)
-    q_conv = thomas_tridiag(a, b, c, d)
-    q_exact = exact_solution(t_conv)
-    error = np.sqrt(np.mean((q_conv - q_exact)**2))
-    dt = T / (N - 1)
-    errors.append(error)
-    print(f"N={N}, dt={sci(dt)}, Error={sci(error)}")
+def gl2_solve(t0, t1, y0, N, w_fun, wdot_fun):
+    t = np.linspace(t0, t1, N+1)
+    h = (t1 - t0)/N
+    Y = np.zeros((N+1, 2), dtype=float)
+    Y[0] = y0
+    for n in range(N):
+        Y[n+1] = gl2_step(t[n], Y[n], h, w_fun, wdot_fun)
+    return t, Y
 
-# Estimate orders
-orders = []
-for i in range(1, len(errors)):
-    order = np.log2(errors[i-1] / errors[i])
-    orders.append(order)
-    print(f"Order between N={Ns[i-1]} and N={Ns[i]}: {order:.2f}")
-print(f"Average order: {np.mean(orders):.2f} (expect ~2 for second-order method)\n")
+# ---------- diagnostics ----------
+def residual_EL(t, Y, w_fun, wdot_fun):
+    """R = d/dt (m w v) - w k q，用中心差分近似 d/dt(...)"""
+    q = Y[:,0]; v = Y[:,1]
+    w = w_fun(t)
+    if wdot_fun is None:
+        wp = np.zeros_like(t)
+    else:
+        wp = wdot_fun(t)
+    p = m*w*v
+    # 中心差分
+    dt = t[1]-t[0]
+    dp = np.zeros_like(p)
+    dp[1:-1] = (p[2:] - p[:-2])/(2*dt)
+    dp[0]  = (p[1]-p[0])/dt
+    dp[-1] = (p[-1]-p[-2])/dt
+    R = dp - w*(k*q)
+    return R
 
-# ---------- Visualization ----------
-plt.figure(figsize=(12, 10))
+# =========================================================
+# (A) 平滑 w：四阶收敛验证（与高分辨率参考解比较）
+# =========================================================
+def test_smooth_convergence():
+    print("=== Smooth w(t): order-4 convergence test (GL2) ===")
+    t0, t1 = 0.0, 1.0
+    y0 = np.array([0.0, 1.0])   # 初值：q(0)=0, v(0)=1
+    # 参考解（很细的步长）
+    N_ref = 32768
+    t_ref, Y_ref = gl2_solve(t0, t1, y0, N_ref, w_smooth, wdot_smooth)
+    q_ref = Y_ref[:,0]; v_ref = Y_ref[:,1]
 
-plt.subplot(2, 2, 1)
-plt.plot(t, q_nonlin, label='q(t) - Nonlinear')
-plt.plot(t, exact_solution(t), '--', label='q(t) - Exact (Linear)')
-plt.title('Nonlinear vs Exact Linear Solution')
-plt.xlabel('t')
-plt.ylabel('q')
-plt.legend()
+    for N in [128, 256, 512, 1024, 2048]:
+        tN, YN = gl2_solve(t0, t1, y0, N, w_smooth, wdot_smooth)
+        # 与参考对齐（下采样）
+        step = N_ref//N
+        q_err = np.linalg.norm(YN[:,0] - q_ref[::step], ord=2)/np.sqrt(N+1)
+        v_err = np.linalg.norm(YN[:,1] - v_ref[::step], ord=2)/np.sqrt(N+1)
+        print(f"N={N:5d},  L2(q)={sci(q_err)},  L2(v)={sci(v_err)}")
+    print("期望：误差 ~ O(N^{-4})，相邻 N 翻倍时误差约降 ~16 倍。\n")
 
-plt.subplot(2, 2, 2)
-plt.plot(t, w_multi)
-plt.title('Weight w(t) - Multiple Interfaces')
-plt.xlabel('t')
-plt.ylabel('w')
-for ts in ts_list:
-    plt.axvline(ts, color='r', linestyle='--', alpha=0.5)
+# =========================================================
+# (B) 硬截止：界面对齐 + A3 动量连续
+# =========================================================
+def test_hard_interface():
+    print("=== Hard step w(t): interface-aligned + momentum continuity (A3) ===")
+    t0, ts, t1 = 0.0, 0.5, 1.0
+    wL, wR = 1.0, 0.2
+    # 左段
+    N1 = 1024
+    y0 = np.array([0.0, 1.0])
+    t1a, Y1 = gl2_solve(t0, ts, y0, N1, lambda t: wL, None)
+    qL, vL = Y1[-1,0], Y1[-1,1]
+    pL = m*wL*vL
 
-plt.subplot(2, 2, 3)
-plt.loglog([1/n for n in Ns], errors, 'o-', label='Error')
-plt.title('Convergence: Error vs 1/N')
-plt.xlabel('1/N')
-plt.ylabel('Error')
-plt.grid(True)
-plt.legend()
+    # A3: p 连续 => v_right0 = (wL/wR) v_left
+    vR0 = (wL/wR)*vL
+    yR0 = np.array([qL, vR0])
 
-plt.subplot(2, 2, 4)
-plt.semilogy(Ns, errors, 'o-', label='Error')
-plt.title('Error vs N')
-plt.xlabel('N')
-plt.ylabel('Error')
-plt.grid(True)
-plt.legend()
+    # 右段
+    N2 = 1024
+    t2b, Y2 = gl2_solve(ts, t1, yR0, N2, lambda t: wR, None)
+    pR0 = m*wR*Y2[0,1]
+    jump = abs(pR0 - pL)
 
-plt.tight_layout()
-plt.show()
+    # 汇总
+    t_full = np.concatenate([t1a, t2b])
+    Y_full = np.vstack([Y1, Y2])
+    R = residual_EL(t_full, Y_full, lambda t: w_hard(t, ts, wL, wR), None)
+    print(f"接口动量跳变 |Δp| = {sci(jump)}   (A3 期望≈0)")
+    print(f"EL 残差 RMS  = {sci(np.sqrt(np.mean(R**2)))}  （分段内 w'=0，仅分段计算）\n")
 
-# ---------- Residual and Momentum Distribution Plots ----------
-plt.figure(figsize=(12, 4))
-plt.subplot(1, 2, 1)
-plt.plot(t, R_multi)
-plt.title('Residual R(t) - Multiple Interfaces')
-plt.xlabel('t')
-plt.ylabel('R')
-plt.grid(True)
+# =========================================================
+# (C) 快速 sanity：EL 残差 + 能量型量纲检查
+# =========================================================
+def quick_sanity():
+    print("=== Quick sanity on smooth w ===")
+    t0, t1 = 0.0, 1.0
+    y0 = np.array([0.0, 1.0])
+    N  = 2048
+    t, Y = gl2_solve(t0, t1, y0, N, w_smooth, wdot_smooth)
+    R = residual_EL(t, Y, w_smooth, wdot_smooth)
+    print(f"EL residual RMS (smooth) = {sci(np.sqrt(np.mean(R**2)))}\n")
 
-plt.subplot(1, 2, 2)
-plt.plot(t[:-1], p_h_multi)
-plt.title('Momentum p_h(t) - Multiple Interfaces')
-plt.xlabel('t')
-plt.ylabel('p_h')
-for ts in ts_list:
-    plt.axvline(ts, color='r', linestyle='--', alpha=0.5)
-plt.grid(True)
-plt.tight_layout()
-plt.show()
+# ---------------- run all ----------------
+if __name__ == "__main__":
+    test_smooth_convergence()
+    test_hard_interface()
+    quick_sanity()
+

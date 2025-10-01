@@ -156,8 +156,10 @@ def gl2_solve_UTH(t0, t1, y0, N, U_s=None):
             if abs(delta_v) < 1e-12:
                 break
         y_short_end[1] = v_plus
-        # Update p_U to maintain dynamics consistency
-        y_short_end[3] = kappa_U * (y_short_end[2] - y_minus[2]) / h_adjust
+        # Update p_U using EL equation at t_s
+        q, v, U, _ = y_short_end
+        dot_U = (y_short_end[2] - y_minus[2]) / h_adjust
+        y_short_end[3] = kappa_U * dot_U
         t_grid2 = np.linspace(t_s, t1, max(1, int((t1 - t_s)/h) + 1))
         Y_grid2 = np.zeros((len(t_grid2), 4))
         Y_grid2[0] = y_short_end
@@ -202,10 +204,14 @@ def setup_corner_W(U_s=0.5, jump_scale=0.1):
 def check_corner_continuity(t, Y, U_s=0.5):
     r"""Check discrete weighted-momentum continuity P_w = W * \partial L/\partial v = W * m * v at half-steps"""
     Pw = []
-    W_minus = W(U_s - 1e-10)  # Use left limit for consistency
+    W_minus = W(U_s - 1e-10)  # Left limit
+    W_plus = W(U_s + 1e-10)   # Right limit
     for i in range(len(t)):
         q, v, U, p_U = Y[i]
-        Pw.append(W_minus * m * v)  # Use W(U_s^-) for P_w
+        if U < U_s:
+            Pw.append(W_minus * m * v)
+        else:
+            Pw.append(W_plus * m * v)
     Pw_half = 0.5 * (np.array(Pw[:-1]) + np.array(Pw[1:]))
     crossings = np.where((Y[:-1,2] < U_s) & (Y[1:,2] >= U_s))[0]
     if crossings.size > 0:
@@ -238,7 +244,7 @@ def check_energy_balance(t, Y):
     return error
 
 # Enhancement 3: Equal-U Grid Resampling
-def resample_to_equal_U(t, Y, num_U_points=1000):
+def resample_to_equal_U(t, Y, num_U_points=2000):
     r"""Resample to uniform U grid assuming U monotone increasing"""
     U = Y[:,2]
     if not np.all(np.diff(U) > 0):
@@ -260,7 +266,7 @@ def compute_EL_residual_U(q, v, U, t=None, is_Uparam=False):
         if t is None:
             raise ValueError("t required for U-parameterized EL residual")
         dt_dU = np.gradient(t, U)
-        dt_dU = savgol_filter(dt_dU, window_length=5, polyorder=2)  # Smooth dt/dU
+        dt_dU = savgol_filter(dt_dU, window_length=9, polyorder=3)  # Enhanced smoothing
         dot_U = 1.0 / np.where(np.abs(dt_dU) < 1e-10, 1e-10, dt_dU)
         q_prime = v / dot_U
         partial_qprime_hatL = W_val * m * q_prime * dot_U**2
@@ -299,7 +305,43 @@ def u_window_diagnostics(U_grid, q_resamp, v_resamp, t_resamp=None, window_size=
         kappa_hat = U_win[np.argmax(kappa_vals)]
         print(rf"U-window [{U_win[0]:.2f}, {U_win[-1]:.2f}]: \Theta={Theta:.4f}, EL_res={EL_res:.4e}, \hat \kappa={kappa_hat:.4f}")
 
-# Enhancement 5: U-Parameterized Integrator
+# Enhancement 5: U-Parameterized Integrator with Adaptive Step
+def gl2_step_UTH_Uparam(Un, yn, h_U, dot_U_threshold=1e-4):
+    if h_U <= 0:
+        raise ValueError("Step size h_U must be positive")
+    q, v, t, p_U = yn
+    dot_U = p_U / kappa_U
+    # Adaptive step size
+    if abs(dot_U) < dot_U_threshold:
+        h_U = h_U * 0.5
+    f0 = f_UTH_Uparam(Un, yn)
+    K1 = f0.copy()
+    K2 = f0.copy()
+    for iter in range(30):
+        Y1 = yn + h_U * (A11 * K1 + A12 * K2)
+        Y2 = yn + h_U * (A21 * K1 + A22 * K2)
+        F1 = f_UTH_Uparam(Un + c1 * h_U, Y1)
+        F2 = f_UTH_Uparam(Un + c2 * h_U, Y2)
+        R1 = K1 - F1
+        R2 = K2 - F2
+        res = np.linalg.norm(np.hstack([R1, R2]), ord=2)
+        if res < 1e-12:
+            break
+        J1 = Jf_UTH_Uparam(Un + c1 * h_U, Y1)
+        J2 = Jf_UTH_Uparam(Un + c2 * h_U, Y2)
+        I = np.eye(4)
+        M11 = I - h_U * A11 * J1
+        M12 = - h_U * A12 * J1
+        M21 = - h_U * A21 * J2
+        M22 = I - h_U * A22 * J2
+        M = np.block([[M11, M12], [M21, M22]])
+        rhs = -np.hstack([R1, R2])
+        dK = np.linalg.solve(M, rhs)
+        K1 += dK[:4]
+        K2 += dK[4:]
+    yn1 = yn + h_U * (b1 * K1 + b2 * K2)
+    return yn1
+
 def f_UTH_Uparam(U, y):
     r"""Dynamics in U-parameter: y = [q, v, t, p_U], \hat L = L(q, v \dot U, t) \dot U"""
     q, v, t, p_U = y
@@ -330,37 +372,6 @@ def Jf_UTH_Uparam(U, y):
     J[3, 3] = - dW_dU_val * m * v * dot_U**2 * (1.0 / kappa_U)
     return J
 
-def gl2_step_UTH_Uparam(Un, yn, h_U):
-    if h_U <= 0:
-        raise ValueError("Step size h_U must be positive")
-    f0 = f_UTH_Uparam(Un, yn)
-    K1 = f0.copy()
-    K2 = f0.copy()
-    for iter in range(30):
-        Y1 = yn + h_U * (A11 * K1 + A12 * K2)
-        Y2 = yn + h_U * (A21 * K1 + A22 * K2)
-        F1 = f_UTH_Uparam(Un + c1 * h_U, Y1)
-        F2 = f_UTH_Uparam(Un + c2 * h_U, Y2)
-        R1 = K1 - F1
-        R2 = K2 - F2
-        res = np.linalg.norm(np.hstack([R1, R2]), ord=2)
-        if res < 1e-12:
-            break
-        J1 = Jf_UTH_Uparam(Un + c1 * h_U, Y1)
-        J2 = Jf_UTH_Uparam(Un + c2 * h_U, Y2)
-        I = np.eye(4)
-        M11 = I - h_U * A11 * J1
-        M12 = - h_U * A12 * J1
-        M21 = - h_U * A21 * J2
-        M22 = I - h_U * A22 * J2
-        M = np.block([[M11, M12], [M21, M22]])
-        rhs = -np.hstack([R1, R2])
-        dK = np.linalg.solve(M, rhs)
-        K1 += dK[:4]
-        K2 += dK[4:]
-    yn1 = yn + h_U * (b1 * K1 + b2 * K2)
-    return yn1
-
 def gl2_solve_UTH_Uparam(U0, U1, y0, N):
     if U1 <= U0 or N <= 0:
         raise ValueError(f"Invalid U0={U0}, U1={U1}, N={N}")
@@ -376,14 +387,21 @@ def gl2_solve_UTH_Uparam(U0, U1, y0, N):
 def test_manufactured_solution(N=512):
     r"""Test with manufactured solution q(t) = sin(t) + 0.1 sin(3t), U(t) = t + 0.3 sin(t)"""
     t0, t1 = 0.0, 1.0
-    y0 = np.array([0.0, 1.0 + 0.3, 0.0, kappa_U * (1.0 + 0.3)])  # q(0), \dot q(0), U(0), p_U(0)
+    y0 = np.array([0.0, 1.0 + 0.3 * 3, 0.0, kappa_U * (1.0 + 0.3)])  # q(0), \dot q(0), U(0), p_U(0)
     global W, dW_dU, d2W_dU2
     W = lambda U: 1.0 + 0.3 * np.sin(2 * np.pi * U)
     dW_dU = lambda U: 0.3 * (2 * np.pi) * np.cos(2 * np.pi * U)
     d2W_dU2 = lambda U: -0.3 * (2 * np.pi)**2 * np.sin(2 * np.pi * U)
     t, Y = gl2_solve_UTH(t0, t1, y0, N)
+    # Compute L2 error
+    t_exact = np.linspace(t0, t1, N+1)
+    q_exact = np.sin(t_exact) + 0.1 * np.sin(3 * t_exact)
+    U_exact = t_exact + 0.3 * np.sin(t_exact)
+    q_error = np.sqrt(np.mean((Y[:,0] - q_exact)**2))
+    U_error = np.sqrt(np.mean((Y[:,2] - U_exact)**2))
     E_q, E_U, E_total = compute_energies(Y)
     print(f"Manufactured solution test: Total energy drift: {sci(E_total[-1] - E_total[0])}")
+    print(f"L2 error q: {sci(q_error)}, L2 error U: {sci(U_error)}")
     error = check_energy_balance(t, Y)
     U_grid, t_resamp, q_resamp, v_resamp = resample_to_equal_U(t, Y)
     u_window_diagnostics(U_grid, q_resamp, v_resamp, t_resamp, window_size=100, is_Uparam=False)
@@ -393,7 +411,7 @@ def test_manufactured_solution(N=512):
 def test_enhanced_UTH(N=512, use_corner=False, a_val=0.3, use_Uparam=False):
     global a
     a = a_val
-    t0, t1 = 0.0, 1.0
+    t0, t1 = 0.0, 2.0  # Extended to ensure U covers [0, 1]
     y0 = np.array([0.0, 1.0, 0.0, kappa_U * 1.0])
     global W, dW_dU, d2W_dU2
     if use_corner:
